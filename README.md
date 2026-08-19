@@ -83,7 +83,7 @@ ComfyUI graph.
 1. Download/clone this folder into your ComfyUI custom nodes directory:
 
    ```
-   ComfyUI/custom_nodes/comfyui_h3_story2seq/
+   ComfyUI/custom_nodes/Comfyui_MinimaxH3_StoryToMultiprompts/
    ```
 
 2. Install the Python dependencies (from ComfyUI's Python environment):
