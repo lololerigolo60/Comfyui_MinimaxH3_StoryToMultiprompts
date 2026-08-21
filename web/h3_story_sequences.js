@@ -1,5 +1,11 @@
 import { app } from "../../scripts/app.js";
 
+// NOTE: ce mapping doit rester identique à DEFAULT_HOSTS dans api.py (source
+// de vérité côté Python, aussi utilisée par nodes.py). Il ne sert ici qu'à
+// mettre à jour le champ "host" de façon synchrone au clic, avant même la
+// réponse de /h3_prompt_studio/models ; refreshModels() ci-dessous corrige
+// silencieusement le champ si la réponse serveur (data.default_host) diverge
+// de cette copie locale, pour ne jamais rester durablement désynchronisé.
 const DEFAULT_HOSTS = {
   ollama: "http://localhost:11434",
   lmstudio: "http://localhost:1234",
@@ -30,6 +36,13 @@ app.registerExtension({
         const res = await fetch(url);
         const data = await res.json();
         const models = data.models?.length ? data.models : ["(saisir un nom de modele)"];
+        // Le serveur (api.py) est la source de vérité pour le host par défaut :
+        // si la copie locale DEFAULT_HOSTS a divergé, on aligne le widget dessus
+        // au lieu de laisser les deux couches diverger silencieusement.
+        if (hostW && data.default_host && hostW.value === lastAutoHost && hostW.value !== data.default_host) {
+          hostW.value = data.default_host;
+          lastAutoHost = data.default_host;
+        }
         for (const w of modelWidgets) {
           const prev = w.value;
           w.options.values = models;
