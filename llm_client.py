@@ -123,13 +123,14 @@ class LLMClient:
     def list_models(self) -> List[LLMModel]:
         backend_label = BACKEND_LABELS.get(self.backend, self.backend)
         try:
+            discovery_timeout = min(self.timeout, 10)
             if self.backend in OPENAI_COMPATIBLE_BACKENDS:
-                r = requests.get(f"{self.base_url}/v1/models", timeout=10)
+                r = requests.get(f"{self.base_url}/v1/models", timeout=discovery_timeout)
                 r.raise_for_status()
                 data = r.json()
                 return [LLMModel(name=m.get("id", "")) for m in data.get("data", []) if m.get("id")]
 
-            r = requests.get(f"{self.base_url}/api/tags", timeout=10)
+            r = requests.get(f"{self.base_url}/api/tags", timeout=discovery_timeout)
             r.raise_for_status()
         except requests.RequestException as e:
             hints = {
@@ -177,8 +178,10 @@ class LLMClient:
         user_prompt: str,
         temperature: float = 0.7,
         num_ctx: Optional[int] = None,
+        max_tokens: Optional[int] = None,
         seed: Optional[int] = None,
         on_token: Optional[Callable[[str], None]] = None,
+        think: Optional[bool] = None,
     ) -> str:
         """
         Envoie system+user au backend actif. Si `on_token` est fourni, la réponse
@@ -187,6 +190,19 @@ class LLMClient:
         `seed` (facultatif) fixe la graine de sampling pour une sortie
         reproductible (supporté par Ollama, llama.cpp ; LM Studio l'accepte
         aussi tant qu'il expose le champ OpenAI-compatible "seed").
+        `max_tokens` (facultatif) borne la longueur de la réponse générée
+        (num_predict côté Ollama, max_tokens côté API OpenAI-compatible) :
+        évite les générations sans limite qui gaspillent du temps/VRAM et
+        réduit le risque de troncature en cours de sortie JSON/texte.
+        `think` (facultatif, Ollama uniquement) : certains modèles (Qwen3.x,
+        DeepSeek-R1, QwQ...) sont des modèles "thinking" qui, par défaut,
+        génèrent un bloc de raisonnement caché avant la vraie réponse - ce
+        bloc consomme une part (parfois très variable) du budget max_tokens
+        sans que ça se voie dans le texte final, ce qui peut faire croire à
+        tort qu'il faut un max_tokens énorme. Passer think=False désactive
+        ce raisonnement pour les sorties structurées (JSON, prompts formatés)
+        où il n'apporte rien ; laisser à None ne touche pas au comportement
+        par défaut du modèle.
         Retourne toujours le texte complet à la fin.
         """
         messages = [
@@ -194,10 +210,10 @@ class LLMClient:
             {"role": "user", "content": user_prompt},
         ]
         if self.backend in OPENAI_COMPATIBLE_BACKENDS:
-            return self._openai_chat(model, messages, temperature, seed, on_token)
-        return self._ollama_chat(model, messages, temperature, num_ctx, seed, on_token)
+            return self._openai_chat(model, messages, temperature, seed, on_token, max_tokens)
+        return self._ollama_chat(model, messages, temperature, num_ctx, seed, on_token, max_tokens, think)
 
-    def _ollama_chat(self, model, messages, temperature, num_ctx, seed, on_token):
+    def _ollama_chat(self, model, messages, temperature, num_ctx, seed, on_token, max_tokens=None, think=None):
         url = f"{self.base_url}/api/chat"
 
         # `temperature`/`num_ctx` peuvent venir directement d'un fichier de config
@@ -218,6 +234,11 @@ class LLMClient:
                 options["seed"] = int(seed)
             except (TypeError, ValueError):
                 pass
+        if max_tokens:
+            try:
+                options["num_predict"] = int(max_tokens)
+            except (TypeError, ValueError):
+                pass
 
         payload = {
             "model": model,
@@ -225,6 +246,11 @@ class LLMClient:
             "options": options,
             "stream": bool(on_token),
         }
+        if think is not None:
+            # Ollama ignore silencieusement ce champ pour les modeles qui ne
+            # supportent pas le raisonnement explicite - sans danger de le
+            # passer meme si le modele actif n'est pas un modele "thinking".
+            payload["think"] = bool(think)
 
         try:
             if on_token:
@@ -255,7 +281,7 @@ class LLMClient:
                 f"Réponse invalide reçue d'Ollama ({model}) : flux interrompu ou JSON malformé. Détail : {e}"
             ) from e
 
-    def _openai_chat(self, model, messages, temperature, seed, on_token):
+    def _openai_chat(self, model, messages, temperature, seed, on_token, max_tokens=None):
         """Appel chat pour tout backend "OpenAI-compatible" (LM Studio, llama.cpp)."""
         backend_label = BACKEND_LABELS.get(self.backend, self.backend)
         url = f"{self.base_url}/v1/chat/completions"
@@ -272,6 +298,11 @@ class LLMClient:
         if seed is not None:
             try:
                 payload["seed"] = int(seed)
+            except (TypeError, ValueError):
+                pass
+        if max_tokens:
+            try:
+                payload["max_tokens"] = int(max_tokens)
             except (TypeError, ValueError):
                 pass
 

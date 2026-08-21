@@ -95,6 +95,7 @@ def generate_story(
     language: str,
     word_count: int = 350,
     temperature: float = 0.85,
+    num_ctx: Optional[int] = None,
     seed: Optional[int] = None,
     on_token: Optional[Callable[[str], None]] = None,
 ) -> str:
@@ -105,6 +106,7 @@ def generate_story(
         system_prompt=STORY_FROM_REFS_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         temperature=temperature,
+        num_ctx=num_ctx,
         seed=seed,
         on_token=on_token,
     )
@@ -221,7 +223,19 @@ def build_breakdown_user_prompt(
     return "\n".join(lines)
 
 
-SEQUENCE_MAX_TOKENS = 4096
+# SEQUENCE_MAX_TOKENS n'est plus une constante fixe : depuis que le prompt de
+# Pass B demande des briefs riches de 5-10 phrases par séquence, une valeur
+# fixe de 4096 déborde dès n_sequences >= ~5-6 (observé : coupure en plein
+# milieu du tout premier "brief", avant la moindre virgule/accolade -> le
+# JSON "réparé" tombe à une chaîne vide -> JSONDecodeError "char 0"). Le
+# budget est donc calculé par séquence + une marge fixe pour le reste du
+# JSON (title/references/dialogue/camera_movement/onscreen_text).
+SEQUENCE_TOKENS_PER_SEQUENCE = 900
+SEQUENCE_TOKENS_OVERHEAD = 700
+
+
+def _sequence_max_tokens(n_sequences: int) -> int:
+    return SEQUENCE_TOKENS_OVERHEAD + SEQUENCE_TOKENS_PER_SEQUENCE * max(1, n_sequences)
 
 
 def generate_sequence_breakdown(
@@ -234,6 +248,7 @@ def generate_sequence_breakdown(
     extra_instructions: str = "",
     duration_per_sequence: int = 8,
     temperature: float = 0.6,
+    num_ctx: Optional[int] = None,
     seed: Optional[int] = None,
 ) -> list[dict]:
     """Pass B. Returns a list of exactly n_sequences sequence dicts.
@@ -242,12 +257,19 @@ def generate_sequence_breakdown(
     user_prompt = build_breakdown_user_prompt(
         story_text, references, n_sequences, camera_motions, extra_instructions, duration_per_sequence
     )
+    breakdown_max_tokens = _sequence_max_tokens(n_sequences)
     raw = client.chat(
         model=model,
         system_prompt=SEQUENCE_BREAKDOWN_SYSTEM_PROMPT,
         user_prompt=user_prompt,
         temperature=temperature,
+        num_ctx=num_ctx,
+        max_tokens=breakdown_max_tokens,
         seed=seed,
+        think=False,  # sortie JSON structurée : le raisonnement caché n'aide
+        # pas et peut a lui seul consommer tout le budget max_tokens sur les
+        # modeles "thinking" (qwen3.x, deepseek-r1...), coupant le JSON avant
+        # meme qu'il ne commence.
     )
     try:
         seqs = _parse_json_sequences(raw, n_sequences)
@@ -268,12 +290,25 @@ def generate_sequence_breakdown(
                 system_prompt=SEQUENCE_BREAKDOWN_SYSTEM_PROMPT,
                 user_prompt=retry_prompt,
                 temperature=max(0.3, temperature - 0.2),
+                num_ctx=num_ctx,
+                max_tokens=int(breakdown_max_tokens * 1.5),
                 seed=seed,
+                think=False,
             )
             try:
                 seqs = _parse_json_sequences(raw_retry, n_sequences)
             except (json.JSONDecodeError, ValueError):
                 repaired_retry = _repair_truncated_json_array(raw_retry)
+                if not repaired_retry.strip():
+                    raise LLMError(
+                        f"Le modèle '{model}' n'a pas réussi à produire un JSON valide pour "
+                        f"les {n_sequences} séquences, même après un nouvel essai (sortie coupée "
+                        f"avant la première virgule/accolade fermante — probablement à cause d'un "
+                        f"'brief' trop long pour le budget de tokens disponible). Essayez : réduire "
+                        f"n_sequences, ou augmenter num_ctx sur ce node (le contexte réellement "
+                        f"chargé par le backend doit couvrir prompt + sortie, et un modèle Ollama "
+                        f"déjà en mémoire garde le num_ctx utilisé lors de son premier chargement)."
+                    )
                 seqs = _parse_json_sequences(repaired_retry, n_sequences)  # let remaining errors surface
 
     return [_reconcile_sequence_references(seq, references) for seq in seqs]
@@ -420,9 +455,23 @@ def sequence_to_brief(
     """Builds one (label, brief) entry compatible with H3StudioApp.run_generation_sequence,
     in the same spirit as Ref2VATab._on_generate_storyboard()."""
     dlg = seq.get("dialogue", {})
+    # Le system prompt Ref2VA (REF2VA_SYSTEM_PROMPT) vise 350-500 mots pour la
+    # seule section detailed_description, sans tenir compte de la duree reelle
+    # du plan - pour un plan de 8-10s c'est disproportionne et ca fait deborder
+    # le prompt final a 850-1100+ tokens. On donne ici une cible explicite,
+    # proportionnelle a duration_per_sequence, qui prime sur la consigne
+    # generique du system prompt (instruction plus specifique et plus recente
+    # dans la conversation).
+    target_words = max(120, min(280, int(duration_per_sequence * 22)))
     lines = [
         f"STORYBOARD SCENE {seq['index']}/{n_total} — treat as its own standalone H3 Ref2VA prompt "
         "(consistent with the same reference library across all scenes).",
+        f"LENGTH OVERRIDE (takes priority over the system prompt's generic word-count guidance): "
+        f"this scene is only {duration_per_sequence}s long, so keep detailed_description around "
+        f"{target_words} English words (not 350-500) - concise, one clear sentence per beat, no "
+        f"padding or repeated description of the same action. Keep every other section (summary, "
+        f"retention_analysis, overall_soundscape, non_diegetic_music, subject_definitions) as brief "
+        f"as the system prompt already asks - 1-3 sentences each, no more.",
         "ISOLATION RULE (critical): the prompt you write must depict ONLY what is described in "
         "\"BRIEF FOR THIS SCENE\" and \"DIALOGUE\" below. The OVERALL STORY line beneath is background "
         "context to keep character/setting consistency ONLY — never pull actions, dialogue, spoken "

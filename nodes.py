@@ -26,6 +26,7 @@ Trois passes LLM (identiques à l'appli d'origine) :
 import io
 import os
 import tempfile
+import time
 
 import numpy as np
 from PIL import Image
@@ -36,8 +37,19 @@ from .sequence_pipeline import (
     generate_sequence_breakdown,
     sequence_to_brief,
     _reference_library_text,
+    _sequence_max_tokens,
 )
 from .system_prompts import REF2VA_SYSTEM_PROMPT
+# Source unique des hosts par défaut par backend (partagée avec api.py et,
+# via la route /h3_prompt_studio/models, avec h3_story_sequences.js) : évite
+# que les trois couches divergent si un host par défaut change un jour.
+from .api import DEFAULT_HOSTS
+
+# TTL cache for the model probe below: INPUT_TYPES is a classmethod that
+# ComfyUI can re-evaluate on every graph load/refresh, so a naive network
+# call there would block the UI whenever the LLM server is slow or down.
+_MODEL_PROBE_CACHE: dict = {}
+_MODEL_PROBE_TTL_SECONDS = 30
 
 MAX_SEQUENCES = 10
 MAX_IMAGES = 9
@@ -64,16 +76,24 @@ LANGUAGES = [
 _FALLBACK_MODELS = ["(saisir un nom de modele)"]
 
 
-def _probe_ollama_models(host: str = "http://localhost:11434") -> list:
+def _probe_ollama_models(host: str = None) -> list:
     """Best-effort discovery for the model combos. Never raises: ComfyUI calls
     INPUT_TYPES at graph-definition time and a dead/absent LLM server must not
-    break node loading."""
+    break node loading. Cached for _MODEL_PROBE_TTL_SECONDS so repeated
+    graph loads/refreshes don't re-hit the network every time."""
+    host = host or DEFAULT_HOSTS["ollama"]
+    now = time.monotonic()
+    cached = _MODEL_PROBE_CACHE.get(host)
+    if cached and (now - cached[0]) < _MODEL_PROBE_TTL_SECONDS:
+        return cached[1]
     try:
-        client = LLMClient(base_url=host, backend="ollama")
+        client = LLMClient(base_url=host, backend="ollama", timeout=3)
         models = [m.name for m in client.list_models() if m.name]
-        return models or list(_FALLBACK_MODELS)
+        result = models or list(_FALLBACK_MODELS)
     except Exception:
-        return list(_FALLBACK_MODELS)
+        result = list(_FALLBACK_MODELS)
+    _MODEL_PROBE_CACHE[host] = (now, result)
+    return result
 
 
 def _tensor_to_tempfile(img_tensor) -> str:
@@ -94,6 +114,27 @@ def _first_frame(image_input):
     return image_input[0]
 
 
+REF2VA_MAX_TOKENS = 1500
+REF2VA_RETRY_MAX_TOKENS = 3000
+REF2VA_REQUIRED_SECTIONS = (
+    "subject_definitions:",
+    "summary:",
+    "retention_analysis:",
+    "detailed_description:",
+    "overall_soundscape:",
+    "non_diegetic_music:",
+)
+
+
+def _missing_ref2va_sections(text: str) -> list:
+    """Detects a Pass C output truncated mid-way (sequences 4-5 issue): if the
+    model runs out of max_tokens before finishing the 6 mandatory sections,
+    the trailing ones are simply absent from the text. Cheap substring check
+    - good enough to trigger a retry with a bigger token budget."""
+    lowered = (text or "").lower()
+    return [s for s in REF2VA_REQUIRED_SECTIONS if s not in lowered]
+
+
 class H3StoryToSequences:
     """Story -> Sequences : references images -> story -> N prompt Ref2VA."""
 
@@ -104,7 +145,7 @@ class H3StoryToSequences:
             "required": {
                 "image_1": ("IMAGE",),
                 "backend": (["ollama", "lmstudio", "llamacpp"], {"default": "ollama"}),
-                "host": ("STRING", {"default": "http://localhost:11434"}),
+                "host": ("STRING", {"default": DEFAULT_HOSTS["ollama"]}),
                 "vision_model": (models, {"default": models[0]}),
                 "story_model": (models, {"default": models[0]}),
                 "sequence_model": (models, {"default": models[0]}),
@@ -114,6 +155,15 @@ class H3StoryToSequences:
                 "word_count": ("INT", {"default": 350, "min": 50, "max": 2000}),
                 "n_sequences": ("INT", {"default": 10, "min": 1, "max": MAX_SEQUENCES}),
                 "duration_per_sequence": ("INT", {"default": 8, "min": 1, "max": 60}),
+                "num_ctx": ("INT", {
+                    "default": 32768, "min": 2048, "max": 131072,
+                    "tooltip": (
+                        "Fenêtre de contexte demandée au backend (Ollama : appliquée directement. "
+                        "LM Studio/llama.cpp : ce champ est ignoré côté API OpenAI-compatible — réglez "
+                        "'Context Length' dans LM Studio au chargement du modèle, sinon la Pass C peut "
+                        "recevoir un prompt tronqué et renvoyer une réponse vide.)"
+                    ),
+                }),
                 "seed": ("INT", {
                     "default": 0, "min": 0, "max": 0xffffffffffffffff,
                     "control_after_generate": True,
@@ -147,6 +197,18 @@ class H3StoryToSequences:
     FUNCTION = "run"
     CATEGORY = "H3 Prompt Studio"
 
+    @classmethod
+    def VALIDATE_INPUTS(cls, vision_model, story_model, sequence_model):
+        # Ces 3 combos sont sondés côté Ollama une seule fois, au chargement du
+        # node (cf. _probe_ollama_models() dans INPUT_TYPES). La vraie liste de
+        # modèles est ensuite rafraîchie dynamiquement côté JS selon le backend
+        # choisi (web/h3_story_sequences.js + api.py) : leur valeur réelle
+        # n'apparaît donc jamais dans cette liste figée. On désactive ici le
+        # contrôle "valeur présente dans la liste" pour ces 3 champs -
+        # LLMClient renverra de toute façon une erreur claire à l'exécution si
+        # le modèle n'existe pas vraiment sur le backend visé.
+        return True
+
     def run(
         self,
         image_1,
@@ -161,6 +223,7 @@ class H3StoryToSequences:
         word_count,
         n_sequences,
         duration_per_sequence,
+        num_ctx,
         temperature_story,
         temperature_sequence,
         temperature_prompt,
@@ -210,6 +273,7 @@ class H3StoryToSequences:
             language=language,
             word_count=word_count,
             temperature=temperature_story,
+            num_ctx=num_ctx,
             seed=seed,
         )
 
@@ -225,6 +289,7 @@ class H3StoryToSequences:
             extra_instructions=extra_instructions,
             duration_per_sequence=duration_per_sequence,
             temperature=temperature_sequence,
+            num_ctx=num_ctx,
             seed=seed,
         )
 
@@ -262,8 +327,37 @@ class H3StoryToSequences:
                 system_prompt=REF2VA_SYSTEM_PROMPT,
                 user_prompt=brief,
                 temperature=temperature_prompt,
+                num_ctx=num_ctx,
+                max_tokens=REF2VA_MAX_TOKENS,
                 seed=seed,
+                think=False,  # cf. llm_client.LLMClient.chat() : evite qu'un modele
+                # "thinking" (qwen3.x, deepseek-r1...) ne brule tout le budget
+                # max_tokens en raisonnement cache avant meme d'ecrire les 6
+                # sections attendues.
             )
+            missing = _missing_ref2va_sections(final_prompt)
+            if missing:
+                # Sortie coupée avant la fin des 6 sections (observé sur des
+                # scènes plus denses en personnages/dialogue) : un seul
+                # retry avec un budget nettement plus large, même mécanisme
+                # de filet de sécurité que Pass B.
+                final_prompt = client.chat(
+                    model=sequence_model,
+                    system_prompt=REF2VA_SYSTEM_PROMPT,
+                    user_prompt=brief,
+                    temperature=temperature_prompt,
+                    num_ctx=num_ctx,
+                    max_tokens=REF2VA_RETRY_MAX_TOKENS,
+                    seed=seed,
+                    think=False,
+                )
+                still_missing = _missing_ref2va_sections(final_prompt)
+                if still_missing:
+                    final_prompt += (
+                        f"\n\n[AVERTISSEMENT H3 Prompt Studio : sortie probablement tronquée - "
+                        f"sections manquantes : {', '.join(still_missing)}. Augmentez num_ctx et/ou "
+                        f"REF2VA_RETRY_MAX_TOKENS dans nodes.py si cela se reproduit.]"
+                    )
             prompts[idx - 1] = final_prompt
 
         return (story_text, *prompts)
